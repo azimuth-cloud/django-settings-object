@@ -49,7 +49,10 @@ class SettingsObject:
         if user_settings is None:
             from django.conf import settings
             user_settings = getattr(settings, self.name, {})
+        # Preserve the original user settings
         self.user_settings = user_settings
+        # Cache setting values as they are processed
+        self.settings_cache = {}
 
 
 class Setting:
@@ -75,12 +78,35 @@ class Setting:
         # Settings should be accessed as instance attributes
         if not instance:
             raise TypeError('Settings cannot be accessed as class attributes')
+        # Try to hit the cache for the setting
         try:
-            return instance.user_settings[self.name]
+            return instance.settings_cache[self.name]
         except KeyError:
-            return self._get_default(instance)
+            pass
+        # If the key is not in the cache, first get the raw value
+        try:
+            value = instance.user_settings[self.name]
+        except KeyError:
+            value = self._get_default(instance)
+        # Apply the transformation
+        value = self._transform(instance, value)
+        # Stash the computed value in the cache before returning it
+        instance.settings_cache[self.name] = value
+        return value
+
+    def _transform(self, instance, value):
+        """
+        Transform the specified value as required.
+        """
+        # By default, this is a NOOP
+        return value
 
     def _get_default(self, instance):
+        """
+        Return the default value of the setting.
+
+        Note that this is called _before_ transformation is applied.
+        """
         # This is provided as a separate method for easier overriding
         if self.default is self.NO_DEFAULT:
             raise ImproperlyConfigured('Required setting: {}.{}'.format(instance.name, self.name))
@@ -106,10 +132,8 @@ class MergedDictSetting(Setting):
         self.defaults = defaults
         super().__init__(default = dict)
 
-    def __get__(self, instance, owner):
-        merged = self.defaults.copy()
-        merged.update(super().__get__(instance, owner))
-        return merged
+    def _transform(self, instance, value):
+        return { **self.defaults, **value }
 
 
 class NestedSetting(Setting):
@@ -120,13 +144,10 @@ class NestedSetting(Setting):
         self.settings_class = settings_class
         super().__init__(default = dict)
 
-    def __get__(self, instance, owner):
+    def _transform(self, instance, value):
         # Use the value of the setting as user values for an instance of the
         # nested settings class, and return that
-        return self.settings_class(
-            '{}.{}'.format(instance.name, self.name),
-            super().__get__(instance, owner)
-        )
+        return self.settings_class(f"{instance.name}.{self.name}", value)
 
 
 class ImportStringSetting(Setting):
@@ -134,10 +155,8 @@ class ImportStringSetting(Setting):
     Property descriptor for a setting that is a dotted-path string that should be
     imported.
     """
-    def __get__(self, instance, owner):
-        return import_callable(
-            super(ImportStringSetting, self).__get__(instance, owner)
-        )
+    def _transform(self, instance, value):
+        return import_callable(value)
 
 
 class ObjectFactorySetting(Setting):
@@ -210,8 +229,5 @@ class ObjectFactorySetting(Setting):
         # For anything else, just return the item
         return item
 
-    def __get__(self, instance, owner):
-        return self._process_item(
-            super(ObjectFactorySetting, self).__get__(instance, owner),
-            '{}.{}'.format(instance.name, self.name)
-        )
+    def _transform(self, instance, value):
+        return self._process_item(value, f"{instance.name}.{self.name}")
